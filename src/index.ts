@@ -1,16 +1,31 @@
-/**
- * IMPORTANT:
- * ---------
- * Do not manually edit this file if you'd like to host your server on Colyseus Cloud
- *
- * If you're self-hosting, you can see "Raw usage" from the documentation.
- *
- * See: https://docs.colyseus.io/server
- */
+import "./bootstrap.js";
+import "dotenv/config";
 import { listen } from "@colyseus/tools";
 
 // Import Colyseus config
 import app from "./app.config.js";
+import { connectDatabase, disconnectDatabase } from "./db/connection.js";
 
-// Create and listen on 2567 (or PORT environment variable.)
-listen(app);
+async function start() {
+  // Connect to MongoDB
+  await connectDatabase();
+
+  // Create and listen on 2567 (or PORT environment variable.)
+  listen(app);
+}
+
+start().catch((err) => {
+  console.error("❌ Error starting server:", err);
+  process.exit(1);
+});
+
+// Graceful shutdown
+process.on("SIGINT", async () => {
+  await disconnectDatabase();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  await disconnectDatabase();
+  process.exit(0);
+});
