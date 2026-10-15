@@ -1,10 +1,11 @@
-import { Room, Client } from "colyseus";
+import { Room, Client, ServerError } from "colyseus";
 import { MyRoomState, Player } from "./schema/MyRoomState.js";
 import {
   verifyGoogleToken,
   syncGoogleUserWithDatabase,
   type GoogleAuthPayload,
 } from "../services/googleAuth.js";
+import { verifySessionToken } from "../services/sessionAuth.js";
 
 export class MyRoom extends Room<{ state: MyRoomState }> {
   maxClients = 50;
@@ -29,41 +30,56 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   ): Promise<any> {
     const { token } = options || {};
 
-    let authPayload: GoogleAuthPayload | null = null;
-
-    if (token) {
-      authPayload = await verifyGoogleToken(token);
-    }
-
-    if (!authPayload) {
-      // Unauthenticated / transient fallback - never saved in DB
-      return {
-        googleId: "transient-" + client.sessionId,
-        email: "",
-        name: "Anonymous",
-        avatar: "",
-        isVerified: false,
-        dbId: "transient-" + client.sessionId,
-      };
-    }
-
-    // Only verified Google accounts are synced with MongoDB Atlas
-    try {
-      const dbUser = await syncGoogleUserWithDatabase(authPayload);
-      return {
-        ...authPayload,
-        dbId: (dbUser as any)._id?.toString() || authPayload.googleId,
-      };
-    } catch (err) {
-      console.warn(
-        "⚠️ [MyRoom] Error syncing user with MongoDB, proceeding in-memory:",
-        err
+    if (!token) {
+      throw new ServerError(
+        401,
+        "Authentication required: Please sign in to join the game."
       );
-      return authPayload;
     }
+
+    // 1. Primary: Verify App Session Token (7-day validity)
+    const sessionUser = verifySessionToken(token);
+    if (sessionUser && sessionUser.isVerified) {
+      return {
+        googleId: sessionUser.googleId,
+        email: sessionUser.email,
+        name: sessionUser.name,
+        avatar: sessionUser.avatar || "",
+        isVerified: true,
+        dbId: sessionUser.id,
+      };
+    }
+
+    // 2. Fallback: Verify raw Google ID token (if client passed Google credential directly)
+    const googlePayload = await verifyGoogleToken(token);
+    if (googlePayload && googlePayload.isVerified) {
+      try {
+        const dbUser = await syncGoogleUserWithDatabase(googlePayload);
+        return {
+          ...googlePayload,
+          dbId: (dbUser as any)._id?.toString() || googlePayload.googleId,
+        };
+      } catch (err) {
+        console.warn(
+          "⚠️ [MyRoom] Error syncing user with MongoDB, proceeding in-memory:",
+          err
+        );
+        return googlePayload;
+      }
+    }
+
+    throw new ServerError(
+      401,
+      "Authentication failed: Invalid or expired session token. Please sign in again."
+    );
   }
 
   onJoin(client: Client, options: any, auth: any) {
+    if (!auth || !auth.isVerified) {
+      client.leave(4001);
+      return;
+    }
+
     const player = new Player();
     player.sessionId = client.sessionId;
     player.userId = auth?.dbId || auth?.googleId || client.sessionId;
@@ -76,7 +92,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     this.state.players.set(client.sessionId, player);
 
     console.log(
-      `🎮 Player joined: ${player.name} (${player.email || "Unverified"}) [sessionId: ${client.sessionId}]`
+      `🎮 Player joined: ${player.name} (${player.email}) [sessionId: ${client.sessionId}]`
     );
 
     client.send("welcome", {
@@ -94,9 +110,9 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
 
   onLeave(client: Client, code?: number) {
     const player = this.state.players.get(client.sessionId);
-    if (player) {
+    if (player && player.isVerified) {
       console.log(
-        `👋 Player left: ${player.name} [sessionId: ${client.sessionId}, code: ${code}]`
+        `👋 Player left: ${player.name} (${player.email}) [sessionId: ${client.sessionId}, code: ${code}]`
       );
       this.state.players.delete(client.sessionId);
     }

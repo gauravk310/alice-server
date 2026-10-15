@@ -17,6 +17,10 @@ import {
   verifyGoogleToken,
   syncGoogleUserWithDatabase,
 } from "./services/googleAuth.js";
+import {
+  createSessionToken,
+  verifySessionToken,
+} from "./services/sessionAuth.js";
 import { User } from "./models/User.js";
 
 const server = defineServer({
@@ -50,7 +54,7 @@ const server = defineServer({
 
     /**
      * POST /api/auth/google
-     * Verify Google ID token from frontend and save/sync user into MongoDB
+     * Verify Google ID token from frontend, sync with MongoDB, and issue a 7-day App Session Token
      */
     app.post("/api/auth/google", async (req, res) => {
       try {
@@ -71,11 +75,25 @@ const server = defineServer({
         }
 
         const user = await syncGoogleUserWithDatabase(authPayload);
+        const userId = (user as any)._id?.toString() || authPayload.googleId;
+
+        // Create 7-day App Session Token
+        const sessionToken = createSessionToken({
+          id: userId,
+          googleId: authPayload.googleId,
+          email: user.email,
+          name: user.name,
+          avatar: user.avatar,
+          isVerified: authPayload.isVerified,
+        });
+
         return res.json({
           success: true,
           message: "Google authentication successful",
+          sessionToken,
+          token: sessionToken,
           user: {
-            id: (user as any)._id?.toString() || authPayload.googleId,
+            id: userId,
             googleId: authPayload.googleId,
             email: user.email,
             name: user.name,
@@ -90,6 +108,67 @@ const server = defineServer({
         return res.status(500).json({
           success: false,
           error: "Internal server error during authentication",
+          details: err?.message,
+        });
+      }
+    });
+
+    /**
+     * POST /api/auth/refresh
+     * Refresh an existing App Session Token without requiring Google sign-in again
+     */
+    app.post("/api/auth/refresh", async (req, res) => {
+      try {
+        const authHeader = req.headers.authorization;
+        const token =
+          req.body?.sessionToken ||
+          req.body?.token ||
+          (authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null);
+
+        if (!token) {
+          return res.status(400).json({
+            success: false,
+            error: "Missing session token to refresh",
+          });
+        }
+
+        const payload = verifySessionToken(token);
+        if (!payload) {
+          return res.status(401).json({
+            success: false,
+            error: "Session expired or invalid. Please sign in again with Google.",
+          });
+        }
+
+        // Issue new 7-day session token
+        const newSessionToken = createSessionToken({
+          id: payload.id,
+          googleId: payload.googleId,
+          email: payload.email,
+          name: payload.name,
+          avatar: payload.avatar,
+          isVerified: payload.isVerified,
+        });
+
+        return res.json({
+          success: true,
+          message: "Session successfully refreshed",
+          sessionToken: newSessionToken,
+          token: newSessionToken,
+          user: {
+            id: payload.id,
+            googleId: payload.googleId,
+            email: payload.email,
+            name: payload.name,
+            avatar: payload.avatar,
+            isVerified: payload.isVerified,
+          },
+        });
+      } catch (err: any) {
+        console.error("❌ [/api/auth/refresh] Refresh error:", err);
+        return res.status(500).json({
+          success: false,
+          error: "Failed to refresh session",
           details: err?.message,
         });
       }

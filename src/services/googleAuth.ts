@@ -80,7 +80,7 @@ export async function verifyGoogleToken(token: string): Promise<GoogleAuthPayloa
 export async function syncGoogleUserWithDatabase(
   profile: GoogleAuthPayload
 ): Promise<IUser | { _id: string; email: string; name: string; avatar: string; role: string; lastLoginAt: Date }> {
-  // Strictly prevent saving guests, mocks, or unverified users in MongoDB
+  // Strictly allow only verified Google accounts
   if (
     !profile ||
     !profile.googleId ||
@@ -90,15 +90,7 @@ export async function syncGoogleUserWithDatabase(
     profile.email.includes("@guest.local") ||
     !profile.isVerified
   ) {
-    console.log("ℹ️ [GoogleAuth] Guest or unverified user - skipping database persistence.");
-    return {
-      _id: profile?.googleId || "transient",
-      email: profile?.email || "",
-      name: profile?.name || "Guest",
-      avatar: profile?.avatar || "",
-      role: "player",
-      lastLoginAt: new Date(),
-    };
+    throw new Error("Unauthorized: Only verified Google accounts can be synced.");
   }
 
   // Check if MongoDB is currently connected
