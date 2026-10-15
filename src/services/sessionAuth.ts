@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import type { Request, Response, NextFunction } from "express";
 
 const JWT_SECRET =
   process.env.JWT_SECRET ||
@@ -14,6 +15,7 @@ export interface SessionUser {
   email: string;
   name: string;
   avatar?: string;
+  role?: string;
   isVerified: boolean;
 }
 
@@ -101,4 +103,43 @@ export function verifySessionToken(token: string): SessionPayload | null {
   } catch (err) {
     return null;
   }
+}
+
+export interface AuthenticatedRequest extends Request {
+  user?: SessionPayload;
+}
+
+/**
+ * Express middleware to authenticate requests via JWT Session Token.
+ * Accepts token in Authorization header (`Bearer <token>`), body (`token` or `sessionToken`), or query parameter.
+ */
+export function authenticateSession(
+  req: Request,
+  res: Response,
+  next: NextFunction
+) {
+  const authHeader = req.headers.authorization;
+  const token =
+    req.body?.sessionToken ||
+    req.body?.token ||
+    (typeof req.query?.token === "string" ? req.query.token : null) ||
+    (authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null);
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      error: "Authentication required: No session token provided",
+    });
+  }
+
+  const user = verifySessionToken(token);
+  if (!user) {
+    return res.status(401).json({
+      success: false,
+      error: "Invalid or expired session token. Please sign in again.",
+    });
+  }
+
+  (req as any).user = user;
+  next();
 }

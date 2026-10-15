@@ -13,6 +13,7 @@ import mongoose from "mongoose";
  * Import your Room files
  */
 import { MyRoom } from "./rooms/MyRoom.js";
+import { activeRoomsMap } from "./rooms/roomRegistry.js";
 import {
   verifyGoogleToken,
   syncGoogleUserWithDatabase,
@@ -20,6 +21,7 @@ import {
 import {
   createSessionToken,
   verifySessionToken,
+  authenticateSession,
 } from "./services/sessionAuth.js";
 import { User } from "./models/User.js";
 
@@ -53,6 +55,35 @@ const server = defineServer({
     });
 
     /**
+     * GET /api/rooms
+     * Return list of active open rooms
+     */
+    app.get("/api/rooms", (req, res) => {
+      const rooms = Array.from(activeRoomsMap.values());
+      return res.json({
+        success: true,
+        count: rooms.length,
+        rooms,
+      });
+    });
+
+    /**
+     * GET /api/rooms/:codeOrId
+     * Search room by roomCode or roomId
+     */
+    app.get("/api/rooms/:codeOrId", (req, res) => {
+      const param = String(req.params.codeOrId).trim().toUpperCase();
+      const rooms = Array.from(activeRoomsMap.values());
+      const found = rooms.find(
+        (r) => r.roomId === req.params.codeOrId || r.roomCode.toUpperCase() === param
+      );
+      if (!found) {
+        return res.status(404).json({ success: false, error: "Room not found" });
+      }
+      return res.json({ success: true, room: found });
+    });
+
+    /**
      * POST /api/auth/google
      * Verify Google ID token from frontend, sync with MongoDB, and issue a 7-day App Session Token
      */
@@ -77,13 +108,14 @@ const server = defineServer({
         const user = await syncGoogleUserWithDatabase(authPayload);
         const userId = (user as any)._id?.toString() || authPayload.googleId;
 
-        // Create 7-day App Session Token
+        // Create 7-day App Session Token (JWT)
         const sessionToken = createSessionToken({
           id: userId,
           googleId: authPayload.googleId,
           email: user.email,
           name: user.name,
           avatar: user.avatar,
+          role: user.role,
           isVerified: authPayload.isVerified,
         });
 
@@ -104,7 +136,7 @@ const server = defineServer({
           },
         });
       } catch (err: any) {
-        console.error("❌ [/api/auth/google] Authentication error:", err);
+        console.error("Authentication error:", err);
         return res.status(500).json({
           success: false,
           error: "Internal server error during authentication",
@@ -147,6 +179,7 @@ const server = defineServer({
           email: payload.email,
           name: payload.name,
           avatar: payload.avatar,
+          role: payload.role,
           isVerified: payload.isVerified,
         });
 
@@ -161,11 +194,12 @@ const server = defineServer({
             email: payload.email,
             name: payload.name,
             avatar: payload.avatar,
+            role: payload.role,
             isVerified: payload.isVerified,
           },
         });
       } catch (err: any) {
-        console.error("❌ [/api/auth/refresh] Refresh error:", err);
+        console.error("Refresh error:", err);
         return res.status(500).json({
           success: false,
           error: "Failed to refresh session",
@@ -175,10 +209,22 @@ const server = defineServer({
     });
 
     /**
-     * GET /api/auth/users
-     * Retrieve registered players (recent 50)
+     * GET /api/auth/me
+     * Validate session token and return the current authenticated player profile
      */
-    app.get("/api/auth/users", async (req, res) => {
+    app.get("/api/auth/me", authenticateSession, (req, res) => {
+      const user = (req as any).user;
+      return res.json({
+        success: true,
+        user,
+      });
+    });
+
+    /**
+     * GET /api/auth/users
+     * Retrieve registered players (recent 50) - Protected by JWT session
+     */
+    app.get("/api/auth/users", authenticateSession, async (req, res) => {
       try {
         if (mongoose.connection.readyState !== 1) {
           return res.status(503).json({
