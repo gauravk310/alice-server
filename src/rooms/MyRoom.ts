@@ -1,4 +1,4 @@
-import { Room, Client, ServerError } from "colyseus";
+﻿import { Room, Client, ServerError, Delayed } from "colyseus";
 import { MyRoomState, Player } from "./schema/MyRoomState.js";
 import {
   verifyGoogleToken,
@@ -17,6 +17,10 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   roomCode = "";
   hostUserId = "";
 
+  private roundInterval?: Delayed;
+  private countdownInterval?: Delayed;
+  private nextRoundInterval?: Delayed;
+
   getPlayersRoster() {
     return Array.from(this.state.players.values()).map((p) => ({
       sessionId: p.sessionId,
@@ -26,6 +30,10 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       isHost: Boolean(p.isHost),
       isReady: Boolean(p.isReady),
       joinedAt: p.joinedAt,
+      points: p.points,
+      isSubmitted: p.isSubmitted,
+      isEliminated: p.isEliminated,
+      lastRoundWon: p.lastRoundWon,
     }));
   }
 
@@ -55,6 +63,9 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     state.roomCode = this.roomCode;
     state.maxPlayers = maxPlayers;
     state.status = "waiting";
+    state.roundNumber = 1;
+    state.roundTimer = 180;
+    state.countdownTimer = 10;
 
     this.setState(state);
 
@@ -91,6 +102,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       });
     });
 
+    // 1. Host triggers match start -> 10-second countdown
     this.onMessage("start_game", (client: Client, message: any) => {
       const player = this.state.players.get(client.sessionId);
       if (!player || !player.isHost) {
@@ -98,25 +110,54 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
         return;
       }
 
-      this.state.status = "starting";
-      const roomSummary = activeRoomsMap.get(this.roomId);
-      if (roomSummary) {
-        roomSummary.status = "in_progress";
+      if (this.state.status === "countdown" || this.state.status === "playing") {
+        return;
       }
 
-      this.broadcast("game_started", {
-        message: "Game started by " + player.name + "!",
-        startedBy: player.name,
-        timestamp: Date.now(),
+      this.startMatchCountdown();
+    });
+
+    // 2. Player submits secret number choice (0 - 100)
+    this.onMessage("submit_guess", (client: Client, message: any) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player || player.isEliminated) return;
+      if (this.state.status !== "playing") return;
+
+      const guessNum = Math.max(0, Math.min(100, Math.round(Number(message?.guess) || 50)));
+      player.currentGuess = guessNum;
+      player.isSubmitted = true;
+
+      // Broadcast that this player locked their choice (without revealing secret guess)
+      this.broadcast("player_guess_submitted", {
+        sessionId: client.sessionId,
       });
 
-      // After 3 seconds countdown transition to playing
-      this.clock.setTimeout(() => {
-        this.state.status = "playing";
-        this.broadcast("game_active", {
-          message: "Arena battle is live!",
-        });
-      }, 3000);
+      // Check if all active players have submitted
+      const activePlayers = Array.from(this.state.players.values()).filter((p) => !p.isEliminated);
+      const allDone = activePlayers.length > 0 && activePlayers.every((p) => p.isSubmitted);
+
+      if (allDone) {
+        this.evaluateRound();
+      }
+    });
+
+    // 3. Skip intermission to next round immediately
+    this.onMessage("start_next_round", (client: Client) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player || !player.isHost) return;
+
+      if (this.nextRoundInterval) {
+        this.nextRoundInterval.clear();
+        this.nextRoundInterval = undefined;
+      }
+      this.startNextRound();
+    });
+
+    // 4. Restart match
+    this.onMessage("restart_game", (client: Client) => {
+      const player = this.state.players.get(client.sessionId);
+      if (!player || !player.isHost) return;
+      this.startMatchCountdown();
     });
 
     this.onMessage("toggle_ready", (client: Client) => {
@@ -136,7 +177,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
           senderName: player.name,
           avatar: player.picture,
           isHost: player.isHost,
-          text: String(message.text).slice(0, 200),
+          text: String(message.text).slice(0, 500),
           timestamp: Date.now(),
         });
       }
@@ -155,6 +196,210 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
         targetClient.leave(4002);
       }
     });
+  }
+
+  // Start 10-Second Countdown
+  private startMatchCountdown() {
+    this.clearAllTimers();
+
+    this.state.status = "countdown";
+    this.state.countdownTimer = 10;
+    this.state.roundNumber = 1;
+
+    // Reset all players: 10 points allocated!
+    this.state.players.forEach((p) => {
+      p.points = 10;
+      p.isEliminated = false;
+      p.isSubmitted = false;
+      p.currentGuess = -1;
+      p.lastRoundWon = false;
+    });
+
+    const roomSummary = activeRoomsMap.get(this.roomId);
+    if (roomSummary) {
+      roomSummary.status = "in_progress";
+    }
+
+    this.broadcast("game_started", {
+      countdown: 10,
+      players: this.getPlayersRoster(),
+      timestamp: Date.now(),
+    });
+
+    this.countdownInterval = this.clock.setInterval(() => {
+      this.state.countdownTimer -= 1;
+      this.broadcast("countdown_tick", {
+        count: this.state.countdownTimer,
+      });
+
+      if (this.state.countdownTimer <= 0) {
+        if (this.countdownInterval) {
+          this.countdownInterval.clear();
+          this.countdownInterval = undefined;
+        }
+        this.startRound();
+      }
+    }, 1000);
+  }
+
+  // Start Round with 3-Minute Timer (180 Seconds)
+  private startRound() {
+    this.clearAllTimers();
+
+    this.state.status = "playing";
+    this.state.roundTimer = 180;
+
+    // Reset submissions for active players
+    this.state.players.forEach((p) => {
+      p.isSubmitted = false;
+      p.currentGuess = -1;
+      p.lastRoundWon = false;
+    });
+
+    this.broadcast("round_started", {
+      round: this.state.roundNumber,
+      timer: 180,
+      players: this.getPlayersRoster(),
+    });
+
+    this.roundInterval = this.clock.setInterval(() => {
+      this.state.roundTimer -= 1;
+
+      // Every 1s update timer on clients
+      if (this.state.roundTimer % 1 === 0) {
+        this.broadcast("round_timer_tick", {
+          timer: this.state.roundTimer,
+        });
+      }
+
+      if (this.state.roundTimer <= 0) {
+        this.evaluateRound();
+      }
+    }, 1000);
+  }
+
+  // Round Evaluation: 0.7 × Average of submitted guesses
+  private evaluateRound() {
+    this.clearAllTimers();
+
+    const activePlayers = Array.from(this.state.players.values()).filter((p) => !p.isEliminated);
+    if (activePlayers.length === 0) return;
+
+    // Assign default 50 for any active player who did not submit in time
+    activePlayers.forEach((p) => {
+      if (!p.isSubmitted || p.currentGuess < 0) {
+        p.currentGuess = 50;
+        p.isSubmitted = true;
+      }
+    });
+
+    // 1. Calculate Average
+    const sum = activePlayers.reduce((acc, p) => acc + p.currentGuess, 0);
+    const average = sum / activePlayers.length;
+
+    // 2. Multiply Average by 0.7
+    const target = average * 0.7;
+    this.state.averageScore = Number(average.toFixed(2));
+    this.state.targetScore = Number(target.toFixed(2));
+
+    // 3. Find player(s) closest to target
+    let minDiff = Infinity;
+    const guessesWithDiff = activePlayers.map((p) => {
+      const diff = Math.abs(p.currentGuess - target);
+      if (diff < minDiff) minDiff = diff;
+      return {
+        sessionId: p.sessionId,
+        name: p.name,
+        guess: p.currentGuess,
+        diff,
+      };
+    });
+
+    const winnerSessionIds: string[] = [];
+    guessesWithDiff.forEach((g) => {
+      if (Math.abs(g.diff - minDiff) < 0.0001) {
+        winnerSessionIds.push(g.sessionId);
+      }
+    });
+
+    // 4. Update Points:
+    // Winners survive and do not lose points.
+    // Losers lose 1 point! Reach 0 = eliminated.
+    activePlayers.forEach((p) => {
+      if (winnerSessionIds.includes(p.sessionId)) {
+        p.lastRoundWon = true;
+      } else {
+        p.lastRoundWon = false;
+        p.points -= 1;
+        if (p.points <= 0) {
+          p.points = 0;
+          p.isEliminated = true;
+        }
+      }
+    });
+
+    this.state.status = "results";
+
+    this.broadcast("round_evaluated", {
+      round: this.state.roundNumber,
+      sum,
+      average: this.state.averageScore,
+      target: this.state.targetScore,
+      winnerSessionIds,
+      guesses: guessesWithDiff,
+      players: this.getPlayersRoster(),
+    });
+
+    // 5. Check survivors
+    const survivors = Array.from(this.state.players.values()).filter((p) => p.points > 0);
+
+    if (survivors.length <= 1) {
+      this.state.status = "victory";
+      const ultimateWinner = survivors[0] || null;
+      this.broadcast("game_over", {
+        winnerSessionId: ultimateWinner?.sessionId || "",
+        winnerName: ultimateWinner?.name || "None",
+        roundsPlayed: this.state.roundNumber,
+      });
+    } else {
+      // 8-Second intermission before next round
+      let intermission = 8;
+      this.broadcast("next_round_countdown", { seconds: intermission });
+
+      this.nextRoundInterval = this.clock.setInterval(() => {
+        intermission -= 1;
+        this.broadcast("next_round_countdown", { seconds: intermission });
+
+        if (intermission <= 0) {
+          if (this.nextRoundInterval) {
+            this.nextRoundInterval.clear();
+            this.nextRoundInterval = undefined;
+          }
+          this.startNextRound();
+        }
+      }, 1000);
+    }
+  }
+
+  private startNextRound() {
+    this.clearAllTimers();
+    this.state.roundNumber += 1;
+    this.startRound();
+  }
+
+  private clearAllTimers() {
+    if (this.roundInterval) {
+      this.roundInterval.clear();
+      this.roundInterval = undefined;
+    }
+    if (this.countdownInterval) {
+      this.countdownInterval.clear();
+      this.countdownInterval = undefined;
+    }
+    if (this.nextRoundInterval) {
+      this.nextRoundInterval.clear();
+      this.nextRoundInterval = undefined;
+    }
   }
 
   async onAuth(
@@ -215,6 +460,11 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     player.picture = auth?.avatar || "";
     player.isVerified = Boolean(auth?.isVerified);
     player.joinedAt = Date.now();
+    player.points = 10;
+    player.isSubmitted = false;
+    player.isEliminated = false;
+    player.currentGuess = -1;
+    player.lastRoundWon = false;
 
     // Determine host: First client or creator
     const isFirstPlayer = this.state.players.size === 0;
@@ -309,6 +559,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   }
 
   onDispose() {
+    this.clearAllTimers();
     activeRoomsMap.delete(this.roomId);
     console.log("Room disposed: " + this.roomId);
   }
