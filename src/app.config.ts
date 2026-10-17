@@ -21,6 +21,7 @@ import {
 import {
   createSessionToken,
   verifySessionToken,
+  verifySessionTokenForRefresh,
   authenticateSession,
 } from "./services/sessionAuth.js";
 import { User } from "./models/User.js";
@@ -164,11 +165,11 @@ const server = defineServer({
           });
         }
 
-        const payload = verifySessionToken(token);
+        const payload = verifySessionTokenForRefresh(token);
         if (!payload) {
           return res.status(401).json({
             success: false,
-            error: "Session expired or invalid. Please sign in again with Google.",
+            error: "Session expired beyond renewal window or invalid. Please sign in again with Google.",
           });
         }
 

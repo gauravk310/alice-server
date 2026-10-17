@@ -60,10 +60,18 @@ export function createSessionToken(
   return `${signatureInput}.${encodedSignature}`;
 }
 
+// Default grace period for token refresh: allows refreshing a token that expired within the last 7 days
+export const DEFAULT_REFRESH_GRACE_PERIOD_SECONDS = 7 * 24 * 60 * 60;
+
 /**
- * Verify an App Session Token. Returns payload if valid and unexpired, null otherwise.
+ * Verify an App Session Token. Returns payload if valid and unexpired (or within optional grace period), null otherwise.
+ * @param token - The raw JWT token string
+ * @param gracePeriodSeconds - Optional grace period in seconds after expiration during which token is still accepted
  */
-export function verifySessionToken(token: string): SessionPayload | null {
+export function verifySessionToken(
+  token: string,
+  gracePeriodSeconds: number = 0
+): SessionPayload | null {
   if (!token || typeof token !== "string") return null;
 
   const parts = token.split(".");
@@ -90,7 +98,7 @@ export function verifySessionToken(token: string): SessionPayload | null {
     const payload: SessionPayload = JSON.parse(base64UrlDecode(encodedPayload));
     const now = Math.floor(Date.now() / 1000);
 
-    if (payload.exp && now > payload.exp) {
+    if (payload.exp && now > payload.exp + gracePeriodSeconds) {
       console.warn(
         `⚠️ [SessionAuth] Session token expired at ${new Date(
           payload.exp * 1000
@@ -103,6 +111,17 @@ export function verifySessionToken(token: string): SessionPayload | null {
   } catch (err) {
     return null;
   }
+}
+
+/**
+ * Verify an App Session Token specifically for refreshing.
+ * Allows validly-signed tokens that have expired within the refresh grace period (7 days by default).
+ */
+export function verifySessionTokenForRefresh(
+  token: string,
+  gracePeriodSeconds: number = DEFAULT_REFRESH_GRACE_PERIOD_SECONDS
+): SessionPayload | null {
+  return verifySessionToken(token, gracePeriodSeconds);
 }
 
 export interface AuthenticatedRequest extends Request {
