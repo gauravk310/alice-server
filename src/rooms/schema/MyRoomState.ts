@@ -1,4 +1,4 @@
-﻿import { schema, t, type SchemaType } from "@colyseus/schema";
+import { schema, t, type SchemaType } from "@colyseus/schema";
 
 export const Player = schema({
   sessionId: t.string().default(""),
@@ -14,6 +14,7 @@ export const Player = schema({
   points: t.number().default(10),
   isSubmitted: t.boolean().default(false),
   isEliminated: t.boolean().default(false),
+  isOffline: t.boolean().default(false),
   currentGuess: t.number().default(-1),
   lastRoundWon: t.boolean().default(false),
 });

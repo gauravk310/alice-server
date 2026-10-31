@@ -1,4 +1,4 @@
-﻿import { Room, Client, ServerError, Delayed } from "colyseus";
+import { Room, Client, ServerError, Delayed } from "colyseus";
 import { MyRoomState, Player } from "./schema/MyRoomState.js";
 import {
   verifyGoogleToken,
@@ -33,6 +33,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       points: p.points,
       isSubmitted: p.isSubmitted,
       isEliminated: p.isEliminated,
+      isOffline: Boolean(p.isOffline),
       lastRoundWon: p.lastRoundWon,
     }));
   }
@@ -134,7 +135,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       });
 
       // Check if all active players have submitted
-      const activePlayers = Array.from(this.state.players.values()).filter((p) => !p.isEliminated);
+      const activePlayers = Array.from(this.state.players.values()).filter((p) => !p.isEliminated && !p.isOffline);
       const allDone = activePlayers.length > 0 && activePlayers.every((p) => p.isSubmitted);
 
       if (allDone) {
@@ -283,7 +284,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
   private evaluateRound() {
     this.clearAllTimers();
 
-    const activePlayers = Array.from(this.state.players.values()).filter((p) => !p.isEliminated);
+    const activePlayers = Array.from(this.state.players.values()).filter((p) => !p.isEliminated && !p.isOffline);
     if (activePlayers.length === 0) return;
 
     // Assign default 50 for any active player who did not submit in time
@@ -352,7 +353,7 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
     });
 
     // 5. Check survivors
-    const survivors = Array.from(this.state.players.values()).filter((p) => p.points > 0);
+    const survivors = Array.from(this.state.players.values()).filter((p) => p.points > 0 && !p.isOffline);
 
     if (survivors.length <= 1) {
       this.state.status = "victory";
@@ -523,35 +524,95 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       console.log(
         "Player left: " + player.name + " [sessionId: " + client.sessionId + "]"
       );
-      this.state.players.delete(client.sessionId);
 
-      // If host leaves, assign next player as host
-      if (player.isHost && this.state.players.size > 0) {
-        const remainingPlayers = Array.from(this.state.players.values());
-        const nextPlayer = remainingPlayers[0];
-        if (nextPlayer) {
-          nextPlayer.isHost = true;
-          this.state.hostSessionId = nextPlayer.sessionId;
-          this.hostUserId = nextPlayer.userId;
+      const isGameActive = this.state.status !== "waiting";
+      if (isGameActive) {
+        player.isOffline = true;
+        player.isEliminated = true;
 
-          const roomSummary = activeRoomsMap.get(this.roomId);
-          if (roomSummary) {
-            roomSummary.hostName = nextPlayer.name;
-            roomSummary.hostAvatar = nextPlayer.picture;
-            roomSummary.hostUserId = nextPlayer.userId;
+        this.broadcast("player_offline", {
+          sessionId: client.sessionId,
+          name: player.name,
+        });
+
+        this.broadcast("player_left", {
+          sessionId: client.sessionId,
+          name: player.name,
+          isOffline: true,
+        });
+
+        // If host leaves, assign next active online player as host
+        if (player.isHost) {
+          const remainingOnline = Array.from(this.state.players.values()).filter((p) => !p.isOffline);
+          if (remainingOnline.length > 0) {
+            const nextPlayer = remainingOnline[0];
+            nextPlayer.isHost = true;
+            this.state.hostSessionId = nextPlayer.sessionId;
+            this.hostUserId = nextPlayer.userId;
+
+            const roomSummary = activeRoomsMap.get(this.roomId);
+            if (roomSummary) {
+              roomSummary.hostName = nextPlayer.name;
+              roomSummary.hostAvatar = nextPlayer.picture;
+              roomSummary.hostUserId = nextPlayer.userId;
+            }
+
+            this.broadcast("host_changed", {
+              newHostSessionId: nextPlayer.sessionId,
+              newHostName: nextPlayer.name,
+            });
           }
+        }
 
-          this.broadcast("host_changed", {
-            newHostSessionId: nextPlayer.sessionId,
-            newHostName: nextPlayer.name,
-          });
+        // Check if all remaining active online players have submitted
+        const activeOnlinePlayers = Array.from(this.state.players.values()).filter(
+          (p) => !p.isEliminated && !p.isOffline
+        );
+
+        if (this.state.status === "playing") {
+          const allDone = activeOnlinePlayers.length > 0 && activeOnlinePlayers.every((p) => p.isSubmitted);
+          if (allDone) {
+            this.evaluateRound();
+          }
+        }
+
+        // If all players in room are offline, disconnect room
+        const allOnline = Array.from(this.state.players.values()).filter((p) => !p.isOffline);
+        if (allOnline.length === 0) {
+          this.disconnect();
+        }
+      } else {
+        this.state.players.delete(client.sessionId);
+
+        // If host leaves, assign next player as host
+        if (player.isHost && this.state.players.size > 0) {
+          const remainingPlayers = Array.from(this.state.players.values());
+          const nextPlayer = remainingPlayers[0];
+          if (nextPlayer) {
+            nextPlayer.isHost = true;
+            this.state.hostSessionId = nextPlayer.sessionId;
+            this.hostUserId = nextPlayer.userId;
+
+            const roomSummary = activeRoomsMap.get(this.roomId);
+            if (roomSummary) {
+              roomSummary.hostName = nextPlayer.name;
+              roomSummary.hostAvatar = nextPlayer.picture;
+              roomSummary.hostUserId = nextPlayer.userId;
+            }
+
+            this.broadcast("host_changed", {
+              newHostSessionId: nextPlayer.sessionId,
+              newHostName: nextPlayer.name,
+            });
+          }
         }
       }
 
       // Update active rooms registry
+      const onlineCount = Array.from(this.state.players.values()).filter((p) => !p.isOffline).length;
       const roomSummary = activeRoomsMap.get(this.roomId);
       if (roomSummary) {
-        roomSummary.playerCount = this.state.players.size;
+        roomSummary.playerCount = onlineCount;
       }
 
       // Broadcast updated roster to all remaining clients
