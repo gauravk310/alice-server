@@ -123,7 +123,8 @@ export class MyRoom extends Room<{ state: MyRoomState }> {
       if (!player || player.isEliminated) return;
       if (this.state.status !== "playing") return;
 
-      const guessNum = Math.max(0, Math.min(100, Math.round(Number(message?.guess) || 50)));
+      const rawGuess = Number(message?.guess);
+      const guessNum = isNaN(rawGuess) ? 50 : Math.max(0, Math.min(100, Math.round(rawGuess)));
       player.currentGuess = guessNum;
       player.isSubmitted = true;
 
